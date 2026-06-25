@@ -1,8 +1,6 @@
-// ferry-data.js — Netlify serverless function v2
-// Fetches Molslinjen schedule + live AIS positions via dma.dk REST API
-// dma.dk = Danish Maritime Authority — free, no API key needed
-//
-// AIS endpoint: https://live.ais.dma.dk/vessel-track/track/track-single/{MMSI}/json
+// ferry-data.js — Netlify serverless function v3
+// AIS via BarentsWatch (Norwegian Coastal Administration — free REST API)
+// Covers all of Scandinavia including Kattegat/Danish waters
 
 export default async (req) => {
   if (req.method !== 'GET') return new Response('Method not allowed', { status: 405 });
@@ -45,8 +43,7 @@ export default async (req) => {
         if (!arrivalOdden || isNaN(arrivalOdden) || arrivalOdden.toISOString().slice(0,10) !== today) continue;
         const shipName = item.shipName || item.vesselName || extractShipName(item.name || '');
         const hour = arrivalOdden.getHours();
-        const dow = arrivalOdden.getDay();
-        const isWE = [0,6].includes(dow);
+        const isWE = [0,6].includes(arrivalOdden.getDay());
         const maxCars = Object.values(FLEET).find(f => f.name === shipName)?.maxCars || 411;
         const estimatedCars = estimateCars(hour, isWE, maxCars);
         schedule.push({
@@ -63,33 +60,26 @@ export default async (req) => {
     }
   } catch (_) {}
 
-  // ── 2. Fetch AIS via dma.dk — Danish Maritime Authority ──────
-  // Free REST API, no key required
-  // Returns latest position + track for each vessel
+  // ── 2. Fetch AIS via BarentsWatch ────────────────────────────
   const vesselPositions = {};
 
   const aisPromises = Object.entries(FLEET).map(async ([mmsi, info]) => {
     try {
-      // DMA live AIS endpoint
       const r = await fetch(
-        `https://live.ais.dma.dk/vessel-track/track/track-single/${mmsi}/json`,
+        `https://www.barentswatch.no/bwapi/v2/latest/combined?mmsi=${mmsi}`,
         {
-          headers: { 'User-Agent': 'GnibenFaergeApp/4.0', Accept: 'application/json' },
+          headers: { 'User-Agent': 'GnibenFaergeApp/4.0', 'Accept': 'application/json' },
           signal: AbortSignal.timeout(6000),
         }
       );
       if (!r.ok) return null;
       const data = await r.json();
 
-      // DMA returns array of track points, latest first
-      const latest = Array.isArray(data) ? data[0] : data;
-      if (!latest) return null;
-
-      const lat = latest.lat ?? latest.latitude ?? latest.Latitude;
-      const lon = latest.lon ?? latest.longitude ?? latest.Longitude;
-      const sog = latest.sog ?? latest.SOG ?? latest.speedOverGround ?? 0;
-      const cog = latest.cog ?? latest.COG ?? 0;
-      const ts  = latest.time ?? latest.timestamp ?? latest.TimeUtc ?? new Date().toISOString();
+      const lat = data.latitude ?? data.lat;
+      const lon = data.longitude ?? data.lon;
+      const sog = data.speedOverGround ?? data.sog ?? 0;
+      const cog = data.courseOverGround ?? data.cog ?? 0;
+      const ts  = data.msgtime ?? data.timestamp ?? new Date().toISOString();
 
       if (lat == null || lon == null) return null;
 
@@ -100,12 +90,11 @@ export default async (req) => {
       }
 
       return {
-        mmsi: Number(mmsi),
-        name: info.name,
-        lat, lon, sog: Math.round(sog * 10) / 10,
+        mmsi: Number(mmsi), name: info.name,
+        lat, lon,
+        sog: Math.round(sog * 10) / 10,
         cog, distNm: Math.round(distNm * 10) / 10,
-        etaOdden,
-        timestamp: ts,
+        etaOdden, timestamp: ts,
         isMoving: sog > 2,
         isAtOdden: distNm < 0.5,
       };
@@ -148,9 +137,8 @@ export default async (req) => {
   }), { status: 200, headers: CORS });
 };
 
-// ── Helpers ──────────────────────────────────────────────────
 function haversineNm(lat1, lon1, lat2, lon2) {
-  const R = 3440.065; // nautical miles
+  const R = 3440.065;
   const dLat = (lat2-lat1)*Math.PI/180;
   const dLon = (lon2-lon1)*Math.PI/180;
   const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
